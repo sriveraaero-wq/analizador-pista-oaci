@@ -1,0 +1,2507 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Analizador de Pista OACI</title>
+  <meta name="theme-color" content="#0F1E30" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Pista OACI" />
+  <link rel="manifest" href="manifest.json" />
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0F1E30; color: #E0EEF8; font-family: system-ui, -apple-system, sans-serif; }
+    input, select, button { font-family: inherit; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #162840; }
+    ::-webkit-scrollbar-thumb { background: #3A6898; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+const {
+  useState
+} = React;
+
+// ═══════════════════════════════════════════════════════════════
+// OACI LOGIC — Anexo 14, Vol. I, 9ª edición (julio 2022)
+// ═══════════════════════════════════════════════════════════════
+
+const getARCNumber = length => {
+  const l = parseFloat(length);
+  if (isNaN(l) || l <= 0) return null;
+  if (l < 800) return 1;
+  if (l < 1200) return 2;
+  if (l < 1800) return 3;
+  return 4;
+};
+
+// §3.1.13 — Pendiente media máxima (max-min / longitud total)
+const MEAN_SLOPE_LIMITS = {
+  1: 2.0,
+  2: 2.0,
+  3: 1.0,
+  4: 1.0
+};
+
+// §3.1.14 — Pendiente local máxima y restricción de cuartos
+// CAMBIO 9ª ed.: restricción 0.8% en cuartos para código 3 SOLO en CAT II/III
+const SLOPE_LIMITS = {
+  1: {
+    maxLong: 2.0,
+    quarter: 2.0,
+    transverse: 2.0
+  },
+  2: {
+    maxLong: 2.0,
+    quarter: 2.0,
+    transverse: 2.0
+  },
+  3: {
+    maxLong: 1.5,
+    quarter: 1.5,
+    transverse: 1.5
+  },
+  // cuarto 0.8 solo CAT II/III
+  4: {
+    maxLong: 1.25,
+    quarter: 0.8,
+    transverse: 1.5
+  }
+};
+
+// Retorna el límite de cuartos según código y categoría de operación (9ª ed.)
+const getQuarterLimit = (arcNum, opCat) => {
+  if (arcNum === 4) return 0.8;
+  if (arcNum === 3 && (opCat === "cat2" || opCat === "cat3")) return 0.8;
+  if (arcNum === 3) return 1.5;
+  return 2.0; // códigos 1 y 2
+};
+const MIN_WIDTHS = {
+  1: {
+    A: 18,
+    B: 18,
+    C: 23
+  },
+  2: {
+    A: 23,
+    B: 23,
+    C: 30
+  },
+  3: {
+    A: 30,
+    B: 30,
+    C: 30,
+    D: 45
+  },
+  4: {
+    C: 45,
+    D: 45,
+    E: 45,
+    F: 60
+  }
+};
+const MIN_LENGTHS = {
+  1: 0,
+  2: 800,
+  3: 1200,
+  4: 1800
+};
+const getCompatibleLetters = arcNum => Object.keys(MIN_WIDTHS[parseInt(arcNum)] || {}).sort();
+const inferLetter = (width, arcNum) => {
+  const w = parseFloat(width);
+  const widths = MIN_WIDTHS[arcNum];
+  if (!widths || isNaN(w)) return "?";
+  const compatible = Object.entries(widths).filter(([, min]) => w >= min).map(([l]) => l).sort();
+  if (!compatible.length) return "<" + Object.keys(widths).sort()[0];
+  return compatible[compatible.length - 1];
+};
+
+// ═══════════════════════════════════════════════════════════════
+// DESIGN TOKENS
+// ═══════════════════════════════════════════════════════════════
+
+const C = {
+  bg: "#0F1E30",
+  surf: "#162840",
+  surf2: "#1C3350",
+  surf3: "#223C5E",
+  border: "#2A4F78",
+  borderBright: "#3A6898",
+  accent: "#6AAEE0",
+  accentDim: "#0F2F52",
+  ok: "#4DC88A",
+  okDim: "#083520",
+  warn: "#F0C040",
+  warnDim: "#2A1E00",
+  danger: "#E85555",
+  dangerDim: "#2A0808",
+  text: "#8BADC8",
+  textMid: "#B8CDE0",
+  textBright: "#E0EEF8",
+  white: "#F4FAFF",
+  mono: '"Courier New", "Courier", monospace'
+};
+
+// ═══════════════════════════════════════════════════════════════
+// CATEGORÍAS DE OPERACIÓN — Anexo 14, Vol. I, 9ª edición (julio 2022)
+// stripWidth = semiancho de franja desde el eje (cada lado), en metros
+// CAMBIO vs 8ª ed.: precisión 150m → 140m; NPA 75m → 140m (§3.4.3/3.4.4)
+// ═══════════════════════════════════════════════════════════════
+
+const OP_CATS = {
+  visual: {
+    label: "Visual",
+    short: "VIS",
+    approachSlope: "5% (1:20)",
+    stripHalfWidth: 75,
+    // §3.4.5 — no-instrumento código 3/4
+    minLength: null,
+    dhRvr: "—",
+    notes: "Sin requisitos ILS. Operación diurna básica.",
+    color: "#4DC88A",
+    quarterLimitCode3: false // no aplica restricción 0.8% en cuartos código 3
+  },
+  npa: {
+    label: "No Precisión (NPA)",
+    short: "NPA",
+    approachSlope: "3.33% (1:30)",
+    stripHalfWidth: 140,
+    // §3.4.4 recomendado — igual que precisión en 9ª ed.
+    minLength: null,
+    dhRvr: "MDA según procedimiento",
+    notes: "VOR / NDB / RNAV-LNAV. Sin glideslope.",
+    color: "#5B9BD5",
+    quarterLimitCode3: false
+  },
+  cat1: {
+    label: "Precisión CAT I",
+    short: "CAT I",
+    approachSlope: "2% (1:50)",
+    stripHalfWidth: 140,
+    // §3.4.3 — código 3/4
+    minLength: 1800,
+    dhRvr: "DH ≥ 60 m | RVR ≥ 550 m",
+    notes: "ILS obligatorio. HIAL. Zonas críticas ILS.",
+    color: "#F0C040",
+    quarterLimitCode3: false // código 3 CAT I: cuartos hasta 1.5%
+  },
+  cat2: {
+    label: "Precisión CAT II",
+    short: "CAT II",
+    approachSlope: "2% (1:50)",
+    stripHalfWidth: 140,
+    // §3.4.3
+    minLength: 1800,
+    dhRvr: "30 m ≤ DH < 60 m | RVR ≥ 300 m",
+    notes: "ILS CAT II. HIAL + luces de zona de contacto y eje.",
+    color: "#F0A040",
+    quarterLimitCode3: true // código 3 CAT II: cuartos ≤ 0.8% (§3.1.14)
+  },
+  cat3: {
+    label: "Precisión CAT III",
+    short: "CAT III",
+    approachSlope: "2% (1:50)",
+    stripHalfWidth: 140,
+    // §3.4.3
+    minLength: 1800,
+    dhRvr: "DH < 30 m o sin DH | RVR < 300 m",
+    notes: "Requisitos maximos. Autoland. RVR critico.",
+    color: "#E85555",
+    quarterLimitCode3: true // código 3 CAT III: cuartos ≤ 0.8% (§3.1.14)
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// SAMPLE DATA
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+// AEROPUERTOS DE EJEMPLO — datos referenciales AIP Perú
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Datos referenciales AIP Perú — verificar contra AIP vigente ───
+const AIRPORTS = {
+  aqp: {
+    _name: "AQP — Arequipa / Rodríguez Ballón",
+    airport: "Aeropuerto Internacional Rodríguez Ballón",
+    runway: "10/28",
+    opCat: "npa",
+    elevation: "2552",
+    tempRef: "24",
+    length: "2800",
+    width: "45",
+    stripDeclared: "280",
+    slopeMean: "",
+    slopeMax: "",
+    slopeQ1: "",
+    slopeQ4: "",
+    slopeTrans: "",
+    c1label: "RWY 10",
+    c1opCat: "visual",
+    c1strip: "280",
+    c1tora: "2800",
+    c1toda: "2800",
+    c1asda: "2800",
+    c1lda: "2800",
+    c2label: "RWY 28",
+    c2opCat: "npa",
+    c2strip: "280",
+    c2tora: "2800",
+    c2toda: "2800",
+    c2asda: "2800",
+    c2lda: "2800"
+  },
+  ayp: {
+    _name: "AYP — Ayacucho / Alfredo Mendívil Duarte",
+    airport: "Aeropuerto Internacional Coronel FAP Alfredo Mendívil Duarte",
+    runway: "12/30",
+    opCat: "npa",
+    elevation: "2719",
+    tempRef: "22",
+    length: "2800",
+    width: "45",
+    stripDeclared: "280",
+    slopeMean: "",
+    slopeMax: "",
+    slopeQ1: "",
+    slopeQ4: "",
+    slopeTrans: "",
+    c1label: "RWY 12",
+    c1opCat: "visual",
+    c1strip: "280",
+    c1tora: "2800",
+    c1toda: "2800",
+    c1asda: "2800",
+    c1lda: "2800",
+    c2label: "RWY 30",
+    c2opCat: "npa",
+    c2strip: "280",
+    c2tora: "2800",
+    c2toda: "2800",
+    c2asda: "2800",
+    c2lda: "2800"
+  },
+  jul: {
+    _name: "JUL — Juliaca / Inca Manco Cápac",
+    airport: "Aeropuerto Internacional Inca Manco Cápac",
+    runway: "12/30",
+    opCat: "npa",
+    elevation: "3826",
+    tempRef: "19.8",
+    length: "4200",
+    width: "45",
+    stripDeclared: "150",
+    slopeMean: "0.05",
+    slopeMax: "0.22",
+    slopeQ1: "0.04",
+    slopeQ4: "0.07",
+    slopeTrans: "",
+    c1label: "RWY 12",
+    c1opCat: "visual",
+    c1strip: "150",
+    c1tora: "4200",
+    c1toda: "4200",
+    c1asda: "4260",
+    c1lda: "4200",
+    c2label: "RWY 30",
+    c2opCat: "npa",
+    c2strip: "150",
+    c2tora: "4200",
+    c2toda: "4200",
+    c2asda: "4260",
+    c2lda: "4200"
+  },
+  pem: {
+    _name: "PEM — Pto. Maldonado / Padre Aldamiz",
+    airport: "Aeropuerto Internacional Padre Aldamiz",
+    runway: "16/34",
+    opCat: "npa",
+    elevation: "256",
+    tempRef: "32",
+    length: "2780",
+    width: "45",
+    stripDeclared: "280",
+    slopeMean: "",
+    slopeMax: "",
+    slopeQ1: "",
+    slopeQ4: "",
+    slopeTrans: "",
+    c1label: "RWY 16",
+    c1opCat: "visual",
+    c1strip: "280",
+    c1tora: "2780",
+    c1toda: "2780",
+    c1asda: "2780",
+    c1lda: "2780",
+    c2label: "RWY 34",
+    c2opCat: "npa",
+    c2strip: "280",
+    c2tora: "2780",
+    c2toda: "2780",
+    c2asda: "2780",
+    c2lda: "2780"
+  },
+  tcq: {
+    _name: "TCQ — Tacna / Coronel FAP Ciriani",
+    airport: "Aeropuerto Internacional Coronel FAP Carlos Ciriani Santa Rosa",
+    runway: "01/19",
+    opCat: "npa",
+    elevation: "475",
+    tempRef: "26",
+    length: "2800",
+    width: "45",
+    stripDeclared: "280",
+    slopeMean: "",
+    slopeMax: "",
+    slopeQ1: "",
+    slopeQ4: "",
+    slopeTrans: "",
+    c1label: "RWY 01",
+    c1opCat: "visual",
+    c1strip: "280",
+    c1tora: "2800",
+    c1toda: "2800",
+    c1asda: "2800",
+    c1lda: "2800",
+    c2label: "RWY 19",
+    c2opCat: "npa",
+    c2strip: "280",
+    c2tora: "2800",
+    c2toda: "2800",
+    c2asda: "2800",
+    c2lda: "2800"
+  }
+};
+const EMPTY = {
+  airport: "",
+  runway: "",
+  opCat: "",
+  elevation: "",
+  tempRef: "",
+  length: "",
+  width: "",
+  stripDeclared: "",
+  slopeMean: "",
+  slopeMax: "",
+  slopeQ1: "",
+  slopeQ4: "",
+  slopeTrans: "",
+  c1label: "",
+  c1opCat: "",
+  c1strip: "",
+  c1tora: "",
+  c1toda: "",
+  c1asda: "",
+  c1lda: "",
+  c2label: "",
+  c2opCat: "",
+  c2strip: "",
+  c2tora: "",
+  c2toda: "",
+  c2asda: "",
+  c2lda: ""
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ALERTA POR ELEVACIÓN — §3.1 corrección altitud/temperatura
+// ═══════════════════════════════════════════════════════════════
+
+const getElevationAlert = elev => {
+  const e = parseFloat(elev);
+  if (isNaN(e)) return null;
+  if (e >= 3000) return {
+    level: "danger",
+    label: "Aeródromo de muy alta altitud (≥ 3 000 m)",
+    note: "La longitud de campo de referencia puede ser 1,5× a 2× la requerida a nivel del mar. El ARC efectivo puede ser mayor al inferido. Se requiere análisis de performance con aeronave crítica."
+  };
+  if (e >= 1500) return {
+    level: "warn",
+    label: "Aeródromo de alta altitud (≥ 1 500 m)",
+    note: "La longitud de campo de referencia aumenta significativamente con la altitud. Verificar con datos de performance de la aeronave crítica."
+  };
+  if (e >= 600) return {
+    level: "info",
+    label: "Aeródromo por encima del nivel base (≥ 600 m)",
+    note: "Considerar corrección por altitud en longitud de campo de referencia."
+  };
+  return null;
+};
+
+// ═══════════════════════════════════════════════════════════════
+// UI PRIMITIVES
+// ═══════════════════════════════════════════════════════════════
+
+const Label = ({
+  children
+}) => /*#__PURE__*/React.createElement("div", {
+  style: {
+    fontSize: 10,
+    color: C.text,
+    letterSpacing: "0.1em",
+    textTransform: "uppercase",
+    fontWeight: 700,
+    marginBottom: 4
+  }
+}, children);
+const Input = ({
+  value,
+  onChange,
+  placeholder,
+  type = "number",
+  suffix
+}) => /*#__PURE__*/React.createElement("div", {
+  style: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6
+  }
+}, /*#__PURE__*/React.createElement("input", {
+  type: type,
+  value: value,
+  onChange: e => onChange(e.target.value),
+  placeholder: placeholder,
+  min: "0",
+  step: "any",
+  style: {
+    flex: 1,
+    background: C.surf3,
+    border: `1px solid ${C.border}`,
+    borderRadius: 5,
+    padding: "7px 10px",
+    color: C.white,
+    fontSize: 13,
+    fontFamily: C.mono,
+    outline: "none",
+    width: "100%"
+  }
+}), suffix && /*#__PURE__*/React.createElement("span", {
+  style: {
+    fontSize: 11,
+    color: C.text,
+    width: 20
+  }
+}, suffix));
+const Field = ({
+  label,
+  value,
+  onChange,
+  placeholder,
+  type,
+  suffix
+}) => /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Label, null, label), /*#__PURE__*/React.createElement(Input, {
+  value: value,
+  onChange: onChange,
+  placeholder: placeholder,
+  type: type,
+  suffix: suffix
+}));
+const Card = ({
+  eyebrow,
+  title,
+  children,
+  style = {}
+}) => /*#__PURE__*/React.createElement("div", {
+  style: {
+    background: C.surf,
+    border: `1px solid ${C.border}`,
+    borderRadius: 10,
+    padding: 18,
+    ...style
+  }
+}, eyebrow && /*#__PURE__*/React.createElement("div", {
+  style: {
+    fontSize: 10,
+    color: C.accent,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    fontWeight: 700,
+    marginBottom: 2
+  }
+}, eyebrow), title && /*#__PURE__*/React.createElement("div", {
+  style: {
+    fontSize: 14,
+    color: C.white,
+    fontWeight: 800,
+    marginBottom: 14,
+    letterSpacing: "-0.01em"
+  }
+}, title), children);
+const Pill = ({
+  label,
+  color,
+  bg
+}) => /*#__PURE__*/React.createElement("span", {
+  style: {
+    display: "inline-block",
+    background: bg || C.accentDim,
+    color: color || C.accent,
+    borderRadius: 4,
+    padding: "2px 8px",
+    fontSize: 11,
+    fontWeight: 700,
+    fontFamily: C.mono
+  }
+}, label);
+const StatusIcon = ({
+  ok
+}) => /*#__PURE__*/React.createElement("span", {
+  style: {
+    fontSize: 14,
+    color: ok ? C.ok : C.danger
+  }
+}, ok ? "✓" : "✗");
+
+// ═══════════════════════════════════════════════════════════════
+// RUNWAY SVG DIAGRAM — signature element
+// ═══════════════════════════════════════════════════════════════
+
+const RunwayDiagram = ({
+  dd
+}) => {
+  if (!dd) return null;
+  const {
+    tora,
+    toda,
+    asda,
+    lda,
+    clearway,
+    stopway,
+    displaced,
+    label
+  } = dd;
+  if (!tora) return null;
+  const W = 520,
+    H = 90;
+  const maxLen = Math.max(toda || tora, asda || tora, tora) * 1.05;
+  const scale = W * 0.82 / maxLen;
+  const ox = 24; // origin x
+
+  const toraW = tora * scale;
+  const clearW = (clearway || 0) * scale;
+  const stopW = (stopway || 0) * scale;
+  const dispW = (displaced || 0) * scale;
+  const dashCount = Math.floor(toraW / 28);
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      borderTop: `1px solid ${C.border}`,
+      paddingTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.text,
+      letterSpacing: "0.1em",
+      textTransform: "uppercase",
+      marginBottom: 4
+    }
+  }, label, " — Planta esquemática"), /*#__PURE__*/React.createElement("svg", {
+    width: "100%",
+    viewBox: `0 0 ${W} ${H}`,
+    style: {
+      overflow: "visible"
+    }
+  }, clearW > 0 && /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("rect", {
+    x: ox + toraW,
+    y: 30,
+    width: clearW,
+    height: 30,
+    fill: "none",
+    stroke: C.accent,
+    strokeWidth: 1,
+    strokeDasharray: "5 4",
+    opacity: 0.5
+  }), /*#__PURE__*/React.createElement("text", {
+    x: ox + toraW + clearW / 2,
+    y: 26,
+    textAnchor: "middle",
+    fill: C.accent,
+    fontSize: 8,
+    fontFamily: "monospace",
+    opacity: 0.8
+  }, "CWY ", clearway, "m")), stopW > 0 && /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("rect", {
+    x: ox + toraW,
+    y: 30,
+    width: stopW,
+    height: 30,
+    fill: C.okDim,
+    stroke: C.ok,
+    strokeWidth: 1
+  }), /*#__PURE__*/React.createElement("text", {
+    x: ox + toraW + stopW / 2,
+    y: 74,
+    textAnchor: "middle",
+    fill: C.ok,
+    fontSize: 8,
+    fontFamily: "monospace"
+  }, "SWY ", stopway, "m")), /*#__PURE__*/React.createElement("rect", {
+    x: ox,
+    y: 30,
+    width: toraW,
+    height: 30,
+    fill: C.surf3,
+    stroke: C.border,
+    strokeWidth: 1,
+    rx: 2
+  }), dispW > 0 && /*#__PURE__*/React.createElement("rect", {
+    x: ox,
+    y: 30,
+    width: dispW,
+    height: 30,
+    fill: C.warnDim,
+    opacity: 0.9,
+    rx: 2
+  }), Array.from({
+    length: dashCount
+  }).map((_, i) => /*#__PURE__*/React.createElement("rect", {
+    key: i,
+    x: ox + dispW + 4 + i * 28,
+    y: 44,
+    width: 16,
+    height: 2,
+    fill: C.accent,
+    opacity: 0.3
+  })), [0, 1, 2, 3].map(i => /*#__PURE__*/React.createElement("rect", {
+    key: i,
+    x: ox + dispW + 3,
+    y: 31 + i * 7,
+    width: 7,
+    height: 5,
+    fill: C.warn,
+    opacity: 0.85
+  })), /*#__PURE__*/React.createElement("rect", {
+    x: ox + toraW - 4,
+    y: 30,
+    width: 3,
+    height: 30,
+    fill: C.textMid,
+    opacity: 0.4
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: ox,
+    y1: 68,
+    x2: ox + toraW,
+    y2: 68,
+    stroke: C.text,
+    strokeWidth: 0.8
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: ox,
+    y1: 65,
+    x2: ox,
+    y2: 71,
+    stroke: C.text,
+    strokeWidth: 0.8
+  }), /*#__PURE__*/React.createElement("line", {
+    x1: ox + toraW,
+    y1: 65,
+    x2: ox + toraW,
+    y2: 71,
+    stroke: C.text,
+    strokeWidth: 0.8
+  }), /*#__PURE__*/React.createElement("text", {
+    x: ox + toraW / 2,
+    y: 78,
+    textAnchor: "middle",
+    fill: C.text,
+    fontSize: 8,
+    fontFamily: "monospace"
+  }, "TORA ", tora, "m"), displaced > 0 && lda && /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("line", {
+    x1: ox + dispW,
+    y1: 20,
+    x2: ox + lda * scale,
+    y2: 20,
+    stroke: C.warn,
+    strokeWidth: 0.8
+  }), /*#__PURE__*/React.createElement("text", {
+    x: ox + dispW + lda * scale / 2,
+    y: 17,
+    textAnchor: "middle",
+    fill: C.warn,
+    fontSize: 8,
+    fontFamily: "monospace"
+  }, "LDA ", lda, "m")), dispW > 0 && /*#__PURE__*/React.createElement("text", {
+    x: ox + dispW / 2,
+    y: 49,
+    textAnchor: "middle",
+    fill: C.warn,
+    fontSize: 7,
+    fontFamily: "monospace"
+  }, "DSPL")));
+};
+
+// ═══════════════════════════════════════════════════════════════
+// AUDIT ENGINE — Anexo 14, Vol. I, 9ª edición (julio 2022)
+// ═══════════════════════════════════════════════════════════════
+
+const runAudit = (data, arcNum, arcLetter, dd) => {
+  const findings = [];
+  let counter = 1;
+  const today = new Date().toLocaleDateString("es-ES", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric"
+  });
+  const addFinding = (severity, param, ref, found, required, description, recommendation) => {
+    const prefix = severity === "NC" ? "NC" : "OB";
+    findings.push({
+      id: `${prefix}-${String(counter++).padStart(3, "0")}`,
+      severity,
+      param,
+      ref,
+      found,
+      required,
+      description,
+      recommendation
+    });
+  };
+  const length = parseFloat(data.length);
+  const width = parseFloat(data.width);
+  const slopeMax = parseFloat(data.slopeMax);
+  const slopeQ1 = parseFloat(data.slopeQ1);
+  const slopeQ4 = parseFloat(data.slopeQ4);
+  const slopeTrans = parseFloat(data.slopeTrans);
+  const limits = SLOPE_LIMITS[arcNum];
+  const minWidth = MIN_WIDTHS[arcNum] && MIN_WIDTHS[arcNum][arcLetter];
+
+  // ── Ancho de pista ─────────────────────────────────────────
+  if (minWidth && !isNaN(width) && width < minWidth) {
+    addFinding("NC", "Ancho de pista", "§3.1.12", `${width} m`, `${minWidth} m mín. para ARC ${arcNum}${arcLetter}`, `El ancho de pista declarado (${width} m) es inferior al mínimo requerido de ${minWidth} m para el ARC ${arcNum}${arcLetter}.`, `Ampliar el ancho de pista en ${minWidth - width} m mediante obras de ensanche lateral.`);
+  }
+
+  // ── Pendientes ─────────────────────────────────────────────
+  if (!isNaN(slopeMax)) {
+    if (slopeMax > limits.maxLong) addFinding("NC", "Pendiente longitudinal máxima", "§3.1.15", `${slopeMax}%`, `≤ ${limits.maxLong}% para núm. ref. ${arcNum}`, `La pendiente longitudinal máxima (${slopeMax}%) supera el límite de ${limits.maxLong}% para número de referencia ${arcNum}.`, `Corregir el perfil longitudinal mediante fresado, recapado o renivelación.`);
+  } else {
+    addFinding("OB", "Pendiente longitudinal máxima", "§3.1.15", "No declarada", "—", "No se declaró la pendiente longitudinal máxima.", "Declarar el dato para completar la evaluación.");
+  }
+  if (!isNaN(slopeQ1)) {
+    if (slopeQ1 > limits.quarter) addFinding("NC", "Pendiente longitudinal — 1° cuarto", "§3.1.15", `${slopeQ1}%`, `≤ ${limits.quarter}%`, `La pendiente del primer cuarto de pista (${slopeQ1}%) supera el límite de ${limits.quarter}%.`, `Corregir el perfil longitudinal en el primer cuarto de pista.`);
+  } else {
+    addFinding("OB", "Pendiente longitudinal — 1° cuarto", "§3.1.15", "No declarada", "—", "No se declaró la pendiente del primer cuarto de pista.", "Declarar el dato para completar la evaluación.");
+  }
+  if (!isNaN(slopeQ4)) {
+    if (slopeQ4 > limits.quarter) addFinding("NC", "Pendiente longitudinal — último cuarto", "§3.1.15", `${slopeQ4}%`, `≤ ${limits.quarter}%`, `La pendiente del último cuarto de pista (${slopeQ4}%) supera el límite de ${limits.quarter}%.`, `Corregir el perfil longitudinal en el último cuarto de pista.`);
+  } else {
+    addFinding("OB", "Pendiente longitudinal — último cuarto", "§3.1.15", "No declarada", "—", "No se declaró la pendiente del último cuarto de pista.", "Declarar el dato para completar la evaluación.");
+  }
+  if (!isNaN(slopeTrans) && slopeTrans > limits.transverse) addFinding("NC", "Pendiente transversal", "§3.1.17", `${slopeTrans}%`, `≤ ${limits.transverse}%`, `La pendiente transversal (${slopeTrans}%) excede el límite de ${limits.transverse}%.`, `Corregir el perfil transversal de la superficie de pista.`);
+
+  // ── Distancias declaradas por RWY ──────────────────────────
+  dd.forEach(item => {
+    if (!item.coherent) addFinding("NC", `Coherencia de distancias — ${item.label}`, "§3.6.1", "Inconsistencia detectada", "TODA ≥ TORA, ASDA ≥ TORA, LDA ≤ TORA", `Las distancias declaradas para ${item.label} son inconsistentes. Verificar que TODA ≥ TORA, ASDA ≥ TORA y LDA ≤ TORA.`, `Revisar y corregir las distancias declaradas publicadas en el AIP.`);
+    if (item.clearway > 0 && item.clearway > item.tora * 0.5) addFinding("NC", `Clearway — ${item.label}`, "§3.4.2", `${item.clearway} m`, `≤ ${item.tora * 0.5} m (50% TORA)`, `El clearway de ${item.label} (${item.clearway} m) supera el 50% de la TORA (${item.tora * 0.5} m).`, `Ajustar la longitud declarada del clearway o revisar la TORA.`);
+
+    // ── Verificación por categoría de operación ───────────────
+    if (item.opCat) {
+      const cat = OP_CATS[item.opCat];
+      const halfW = cat.stripHalfWidth;
+      const stripRef = item.opCat === "visual" ? "§3.4.5" : item.opCat === "npa" ? "§3.4.4" : "§3.4.3";
+
+      // Usar franja declarada si está disponible; sino usar ancho de pista como proxy
+      const stripHalfActual = item.stripDeclared ? item.stripDeclared / 2 : width;
+      const stripSource = item.stripDeclared ? "franja declarada " + item.stripDeclared + " m total (" + item.stripDeclared / 2 + " m c/lado)" : "ancho de pista " + width + " m (proxy)";
+      if (!isNaN(stripHalfActual) && stripHalfActual < halfW) addFinding("NC", "Semiancho de franja - " + item.label, stripRef, stripSource, halfW + " m c/lado para " + cat.short + " (Anexo 14 9a ed.)", "El semiancho de franja disponible (" + stripHalfActual + " m) es inferior al minimo de " + halfW + " m a cada lado del eje requerido para " + cat.short + " en " + item.label + ".", "Ampliar la franja libre de obstaculos a " + halfW + " m a cada lado del eje de pista (" + halfW * 2 + " m total).");
+      if (cat.minLength && !isNaN(length) && length < cat.minLength) addFinding("OB", "Longitud referencial - " + item.label, "§3.1", length + " m", ">= " + cat.minLength + " m ref. para " + cat.short, "La longitud de pista (" + length + " m) es inferior a la longitud referencial minima (" + cat.minLength + " m) para " + cat.short + ". Sujeto a confirmacion con aeronave critica.", "Verificar longitud de campo de referencia de la aeronave critica. Puede requerirse extension de pista.");
+    }
+  });
+
+  // ── Alerta por elevación del aeródromo ────────────────────
+  const elevAlert = getElevationAlert(data.elevation);
+  if (elevAlert && elevAlert.level === "danger") {
+    addFinding("OB", "Aeródromo de muy alta altitud - corrección por elevación", "§3.1", parseFloat(data.elevation) + " m AMSL", "Análisis de performance requerido", "La elevación del aeródromo (" + parseFloat(data.elevation).toFixed(0) + " m AMSL) requiere corrección significativa de la longitud de campo de referencia. El ARC inferido puede subestimar los requisitos reales.", "Realizar análisis de performance con aeronave crítica a la elevación e ISA+" + (data.tempRef ? (parseFloat(data.tempRef) - (15 - parseFloat(data.elevation) * 0.0065)).toFixed(1) : "X") + " para determinar el ARC efectivo.");
+  } else if (elevAlert && elevAlert.level === "warn") {
+    addFinding("OB", "Aeródromo de alta altitud - verificar corrección por elevación", "§3.1", parseFloat(data.elevation) + " m AMSL", "Verificar con datos de performance", "La elevación del aeródromo (" + parseFloat(data.elevation).toFixed(0) + " m AMSL) puede requerir corrección en la longitud de campo de referencia.", "Verificar longitud de campo de referencia de la aeronave crítica a la elevación real del aeródromo.");
+  }
+  const ncs = findings.filter(f => f.severity === "NC");
+  const obs = findings.filter(f => f.severity === "OB");
+  const status = ncs.length > 0 ? "no-conforme" : obs.length > 0 ? "conforme-obs" : "conforme";
+  return {
+    findings,
+    ncs,
+    obs,
+    status,
+    date: today
+  };
+};
+
+// ═══════════════════════════════════════════════════════════════
+// ARC BADGE
+// ═══════════════════════════════════════════════════════════════
+
+const ARCBadge = ({
+  num,
+  letter
+}) => /*#__PURE__*/React.createElement("div", {
+  style: {
+    textAlign: "center",
+    padding: "16px 0 8px"
+  }
+}, /*#__PURE__*/React.createElement("div", {
+  style: {
+    fontSize: 10,
+    color: C.accent,
+    letterSpacing: "0.14em",
+    textTransform: "uppercase",
+    marginBottom: 6
+  }
+}, "Código de Referencia de Aeródromo"), /*#__PURE__*/React.createElement("div", {
+  style: {
+    display: "flex",
+    alignItems: "baseline",
+    justifyContent: "center",
+    lineHeight: 1
+  }
+}, /*#__PURE__*/React.createElement("span", {
+  style: {
+    fontSize: 80,
+    fontWeight: 900,
+    color: C.white,
+    fontFamily: C.mono,
+    lineHeight: 1
+  }
+}, num), /*#__PURE__*/React.createElement("span", {
+  style: {
+    fontSize: 64,
+    fontWeight: 900,
+    color: C.accent,
+    fontFamily: C.mono,
+    lineHeight: 1
+  }
+}, letter)), /*#__PURE__*/React.createElement("div", {
+  style: {
+    fontSize: 11,
+    color: C.text,
+    marginTop: 8,
+    lineHeight: 1.5
+  }
+}, "Letra inferida por ancho de pista.", /*#__PURE__*/React.createElement("br", null), "Confirmar con aeronave crítica."));
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════
+
+function App() {
+  const [d, setD] = useState(EMPTY);
+  const [results, setResults] = useState(null);
+  const [target, setTarget] = useState({
+    num: "",
+    letter: "",
+    opCat: ""
+  });
+  const [gaps, setGaps] = useState(null);
+  const [audit, setAudit] = useState(null);
+  const upd = field => val => setD(prev => ({
+    ...prev,
+    [field]: val
+  }));
+  const analyzeDD = (prefix, fallback) => {
+    const tora = parseFloat(d[prefix + "tora"]);
+    if (isNaN(tora)) return null;
+    const toda = parseFloat(d[prefix + "toda"]) || tora;
+    const asda = parseFloat(d[prefix + "asda"]) || tora;
+    const lda = parseFloat(d[prefix + "lda"]) || tora;
+    const label = d[prefix + "label"] || fallback;
+    const opCat = d[prefix + "opCat"] || "";
+    const stripRwy = parseFloat(d[prefix + "strip"]) || parseFloat(d.stripDeclared) || null;
+    return {
+      label,
+      opCat,
+      tora,
+      toda,
+      asda,
+      lda,
+      stripDeclared: stripRwy,
+      clearway: toda > tora ? toda - tora : 0,
+      stopway: asda > tora ? asda - tora : 0,
+      displaced: lda < tora ? tora - lda : 0,
+      coherent: toda >= tora && asda >= tora && lda <= tora
+    };
+  };
+  const handleAnalyze = () => {
+    const arcNum = getARCNumber(d.length);
+    if (!arcNum) return;
+    const limits = SLOPE_LIMITS[arcNum];
+    const arcLetter = inferLetter(parseFloat(d.width), arcNum);
+    const dd = [analyzeDD("c1", "RWY 1"), analyzeDD("c2", "RWY 2")].filter(Boolean);
+    // Categoría dominante para límite de cuartos (más restrictiva entre las dos cabeceras)
+    const opCats = dd.map(r => r.opCat).filter(Boolean);
+    const hasCat23 = opCats.some(c => c === "cat2" || c === "cat3");
+    const quarterLimit = getQuarterLimit(arcNum, hasCat23 ? "cat2" : opCats[0] || "");
+    const meanLimit = MEAN_SLOPE_LIMITS[arcNum];
+    setResults({
+      arcNum,
+      arcLetter,
+      limits,
+      meanLimit,
+      quarterLimit,
+      hasCat23,
+      dd
+    });
+    setAudit(runAudit(d, arcNum, arcLetter, dd));
+    setGaps(null);
+    setTarget({
+      num: "",
+      letter: "",
+      opCat: ""
+    });
+  };
+  const handlePrint = () => {
+    if (!audit || !results) return;
+    const statusCfg = {
+      "conforme": {
+        label: "CONFORME",
+        color: "#2d7a4f",
+        icon: "&#10003;"
+      },
+      "conforme-obs": {
+        label: "CONFORME CON OBSERVACIONES",
+        color: "#b7791f",
+        icon: "&#9888;"
+      },
+      "no-conforme": {
+        label: "NO CONFORME",
+        color: "#c0392b",
+        icon: "&#10007;"
+      }
+    }[audit.status];
+    const cats = results.dd.filter(rwy => rwy.opCat && OP_CATS[rwy.opCat]).map(rwy => "<span style='border:1px solid #1a3a6a;color:#1a3a6a;padding:1px 8px;border-radius:3px;font-weight:700;font-size:11px;margin-right:6px'>" + rwy.label + ": " + OP_CATS[rwy.opCat].short + " - " + OP_CATS[rwy.opCat].label + "</span>").join("");
+    const findingRows = audit.findings.map((f, i) => {
+      const color = f.severity === "NC" ? "#c0392b" : "#d68910";
+      const bgHeader = f.severity === "NC" ? "#fdf0f0" : "#fdf8e8";
+      return "<div style='margin-bottom:14px;border:1px solid " + color + "44;border-radius:6px;overflow:hidden;page-break-inside:avoid'>" + "<div style='background:" + bgHeader + ";padding:8px 12px;display:flex;align-items:center;gap:12px;border-bottom:1px solid " + color + "33'>" + "<span style='font-family:monospace;font-weight:900;color:" + color + ";font-size:13px;min-width:60px'>" + f.id + "</span>" + "<span style='font-weight:800;color:" + color + ";font-size:11px;letter-spacing:.06em'>" + f.severity + "</span>" + "<span style='font-weight:700;color:#111;font-size:13px;flex:1'>" + f.param + "</span>" + "<span style='color:" + color + ";font-family:monospace;font-size:11px;background:" + color + "18;padding:1px 7px;border-radius:3px;font-weight:700'>" + f.ref + "</span>" + "</div>" + "<div style='padding:10px 12px;background:#fff'>" + "<table style='width:100%;margin-bottom:8px'><tr>" + "<td style='width:50%;padding-right:12px;vertical-align:top'>" + "<div style='font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px'>Valor encontrado</div>" + "<div style='font-family:monospace;font-size:12px;color:" + color + ";font-weight:700'>" + f.found + "</div>" + "</td>" + "<td style='width:50%;vertical-align:top'>" + "<div style='font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px'>Requisito normativo</div>" + "<div style='font-family:monospace;font-size:12px;color:#444'>" + f.required + "</div>" + "</td>" + "</tr></table>" + "<div style='margin-bottom:6px'>" + "<div style='font-size:9px;color:#888;text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px'>Descripcion</div>" + "<div style='font-size:11px;color:#222;line-height:1.5'>" + f.description + "</div>" + "</div>" + "<div style='padding-top:6px;border-top:1px solid #eee'>" + "<div style='font-size:9px;color:#1a3a6a;text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px'>Recomendacion</div>" + "<div style='font-size:11px;color:#222;line-height:1.5'>" + f.recommendation + "</div>" + "</div>" + "</div>" + "</div>";
+    }).join("");
+    const resumen = audit.status === "conforme" ? "La pista " + (d.runway || "") + " del " + (d.airport || "aeropuerto") + " cumple todos los parametros fisicos evaluados conforme al ARC " + results.arcNum + results.arcLetter + " y las categorias de operacion declaradas." : audit.status === "conforme-obs" ? "La pista " + (d.runway || "") + " no presenta no conformidades, pero se identificaron " + audit.obs.length + " observacion(es) por datos no declarados. Se recomienda completar la informacion para una evaluacion integral." : "La pista " + (d.runway || "") + " presenta " + audit.ncs.length + " no conformidad(es) respecto al ARC " + results.arcNum + results.arcLetter + " y las categorias de operacion declaradas. Se requieren intervenciones correctivas.";
+    const html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Informe - " + (d.airport || "Aeropuerto") + "</title>" + "<style>body{font-family:Arial,sans-serif;padding:32px 40px;color:#111;font-size:12px}" + "h1{font-size:20px;font-weight:900;color:#0a1e3c;margin:0}" + "table{width:100%;border-collapse:collapse;font-size:10px}" + "th{padding:5px 7px;text-align:left;font-weight:800;color:#0a1e3c;border-bottom:2px solid #1a3a6a;font-size:9px;text-transform:uppercase;background:#e8eef6}" + ".status-box{text-align:center;border:2px solid " + statusCfg.color + ";border-radius:8px;padding:10px 16px;min-width:130px}" + ".summary{margin-top:20px;padding:12px 14px;border:2px solid " + statusCfg.color + ";border-radius:6px}" + ".footer{margin-top:20px;padding-top:10px;border-top:1px solid #ccd6e8;display:flex;justify-content:space-between;font-size:8px;color:#888}" + "@media print{body{padding:20px 28px}}" + "</style></head><body>" + "<div style='border-bottom:2px solid #1a3a6a;padding-bottom:14px;margin-bottom:18px;display:flex;justify-content:space-between;align-items:flex-start'>" + "<div>" + "<div style='font-size:9px;color:#666;text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px'>Informe de Auditoria Preliminar - OACI Anexo 14, Vol. I, 9a edicion (julio 2022)</div>" + "<h1>" + (d.airport || "Aeropuerto sin nombre") + "</h1>" + "<div style='color:#444;margin-top:4px'>Pista " + (d.runway || "-") + " | ARC " + results.arcNum + results.arcLetter + " | " + audit.date + "</div>" + "<div style='margin-top:6px'>" + cats + "</div>" + "</div>" + "<div class='status-box'>" + "<div style='font-size:20px;font-weight:900;color:" + statusCfg.color + "'>" + statusCfg.icon + "</div>" + "<div style='font-size:9px;font-weight:900;color:" + statusCfg.color + ";text-transform:uppercase;margin-top:2px'>" + statusCfg.label + "</div>" + "<div style='font-size:10px;color:#555;margin-top:4px'>" + audit.ncs.length + " NC - " + audit.obs.length + " OB</div>" + "</div>" + "</div>" + "<div style='font-size:11px;font-weight:800;color:#0a1e3c;text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px'>Hallazgos (" + audit.findings.length + ")</div>" + (audit.findings.length === 0 ? "<p style='color:#2d7a4f'>No se identificaron hallazgos.</p>" : findingRows) + "<div class='summary'>" + "<div style='font-size:10px;font-weight:900;color:" + statusCfg.color + ";text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px'>Resumen Ejecutivo</div>" + "<div style='line-height:1.6'>" + resumen + "</div>" + "</div>" + "<div class='footer'>" + "<span>Analizador de Pista OACI - Informe Preliminar</span>" + "<span>OACI Anexo 14, Vol. I, 9a edicion (julio 2022)</span>" + "<span>" + audit.date + "</span>" + "</div>" + "</body></html>";
+    const blob = new Blob([html], {
+      type: "text/html;charset=utf-8"
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const filename = "informe-pista-" + (d.runway || "rwy").replace("/", "-") + "-" + audit.date.replace(/\//g, "") + ".html";
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+  const handleGapAnalysis = () => {
+    if (!results || !target.num || !target.letter) return;
+    const tNum = parseInt(target.num);
+    const tLetter = target.letter;
+    const tLimits = SLOPE_LIMITS[tNum];
+    const tMinWidth = MIN_WIDTHS[tNum] ? MIN_WIDTHS[tNum][tLetter] : null;
+    const tMinLength = MIN_LENGTHS[tNum];
+    const length = parseFloat(d.length);
+    const width = parseFloat(d.width);
+    const rows = [];
+    rows.push({
+      param: "Longitud física",
+      current: `${length} m`,
+      required: `≥ ${tMinLength} m`,
+      delta: length >= tMinLength ? "—" : `+${tMinLength - length} m`,
+      ok: length >= tMinLength,
+      action: length >= tMinLength ? "Sin intervención" : "Extensión de pista"
+    });
+    if (tMinWidth !== null) {
+      rows.push({
+        param: "Ancho de pista",
+        current: `${width} m`,
+        required: `${tMinWidth} m`,
+        delta: width >= tMinWidth ? "—" : `+${tMinWidth - width} m`,
+        ok: width >= tMinWidth,
+        action: width >= tMinWidth ? "Sin intervención" : "Ensanche de pista"
+      });
+    }
+    [{
+      key: "slopeMax",
+      label: "Pendiente long. máx.",
+      limit: tLimits && tLimits.maxLong
+    }, {
+      key: "slopeQ1",
+      label: "Pendiente 1° cuarto",
+      limit: tLimits && tLimits.quarter
+    }, {
+      key: "slopeQ4",
+      label: "Pendiente último cuarto",
+      limit: tLimits && tLimits.quarter
+    }, {
+      key: "slopeTrans",
+      label: "Pendiente transversal",
+      limit: 1.5
+    }].forEach(({
+      key,
+      label,
+      limit
+    }) => {
+      const val = parseFloat(d[key]);
+      if (isNaN(val) || limit === undefined) return;
+      const exceeds = val > limit;
+      rows.push({
+        param: label,
+        current: `${val}%`,
+        required: `≤ ${limit}%`,
+        delta: exceeds ? `+${(val - limit).toFixed(2)}%` : "—",
+        ok: !exceeds,
+        action: exceeds ? "Corrección de perfil" : "Sin intervención"
+      });
+    });
+    setGaps({
+      from: `${results.arcNum}${results.arcLetter}`,
+      to: `${tNum}${tLetter}`,
+      fromCat: d.opCat ? d.opCat && OP_CATS[d.opCat] ? OP_CATS[d.opCat].short : null : null,
+      toCat: target.opCat ? target.opCat && OP_CATS[target.opCat] ? OP_CATS[target.opCat].short : null : null,
+      rows,
+      catRows: (() => {
+        if (!target.opCat || !d.opCat || d.opCat === target.opCat) return [];
+        const from = OP_CATS[d.opCat];
+        const to = OP_CATS[target.opCat];
+        const width = parseFloat(d.width);
+        const length = parseFloat(d.length);
+        const catR = [];
+        catR.push({
+          param: "Sup. de aproximación",
+          current: from.approachSlope,
+          required: to.approachSlope,
+          delta: "—",
+          ok: true,
+          action: "Actualización de procedimiento"
+        });
+        catR.push({
+          param: "Ancho de franja",
+          current: `${from.stripWidth} m`,
+          required: `${to.stripWidth} m`,
+          delta: width >= to.stripWidth ? "—" : `+${to.stripWidth - from.stripWidth} m`,
+          ok: from.stripWidth >= to.stripWidth,
+          action: from.stripWidth >= to.stripWidth ? "Sin intervención" : "Ampliación de franja"
+        });
+        if (to.minLength) {
+          catR.push({
+            param: "Longitud referencial",
+            current: `${length} m`,
+            required: `≥ ${to.minLength} m`,
+            delta: length >= to.minLength ? "—" : `+${to.minLength - length} m`,
+            ok: length >= to.minLength,
+            action: length >= to.minLength ? "Sin intervención" : "Extensión de pista"
+          });
+        }
+        catR.push({
+          param: "Sistema de aproximación",
+          current: from.label,
+          required: to.label,
+          delta: "—",
+          ok: null,
+          action: "Instalación ILS / equipos NavAids"
+        });
+        catR.push({
+          param: "DH / RVR",
+          current: from.dhRvr,
+          required: to.dhRvr,
+          delta: "—",
+          ok: null,
+          action: "Certificación operacional"
+        });
+        return catR;
+      })(),
+      critical: rows.filter(r => !r.ok)
+    });
+  };
+
+  // ─── RENDER ──────────────────────────────────────────────────
+
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.bg,
+      minHeight: "100vh",
+      color: C.textBright,
+      fontFamily: "system-ui, -apple-system, sans-serif",
+      paddingBottom: 60
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: C.surf,
+      borderBottom: `1px solid ${C.border}`,
+      padding: "14px 22px",
+      display: "flex",
+      alignItems: "center",
+      gap: 14
+    }
+  }, /*#__PURE__*/React.createElement("svg", {
+    width: "36",
+    height: "36",
+    viewBox: "0 0 36 36"
+  }, /*#__PURE__*/React.createElement("rect", {
+    width: "36",
+    height: "36",
+    rx: "8",
+    fill: C.accentDim
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: "4",
+    y: "17",
+    width: "28",
+    height: "3",
+    rx: "1.5",
+    fill: C.border
+  }), [6, 10, 14, 18, 22].map(x => /*#__PURE__*/React.createElement("rect", {
+    key: x,
+    x: x,
+    y: "18",
+    width: "3",
+    height: "1.5",
+    fill: C.accent,
+    opacity: "0.7"
+  })), /*#__PURE__*/React.createElement("rect", {
+    x: "4",
+    y: "17",
+    width: "2",
+    height: "3",
+    fill: C.warn,
+    opacity: "0.8"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: "30",
+    y: "17",
+    width: "2",
+    height: "3",
+    fill: C.warn,
+    opacity: "0.8"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: "17",
+    y: "8",
+    width: "2",
+    height: "6",
+    rx: "1",
+    fill: C.accent,
+    opacity: "0.5"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 16,
+      fontWeight: 800,
+      color: C.white,
+      letterSpacing: "-0.01em"
+    }
+  }, "Analizador de Pista"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.text,
+      letterSpacing: "0.1em",
+      textTransform: "uppercase"
+    }
+  }, "OACI Anexo 14 — Vol. I, 9ª edición (julio 2022)")), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      setD(EMPTY);
+      setResults(null);
+      setGaps(null);
+      setAudit(null);
+    },
+    style: {
+      marginLeft: "auto",
+      background: "none",
+      border: "1px solid " + C.border,
+      borderRadius: 6,
+      padding: "6px 14px",
+      color: C.text,
+      fontSize: 12,
+      cursor: "pointer"
+    }
+  }, "Nuevo"), /*#__PURE__*/React.createElement("select", {
+    defaultValue: "",
+    onChange: e => {
+      if (e.target.value === "") return;
+      const ap = AIRPORTS[e.target.value];
+      if (ap) {
+        setD(ap);
+        setResults(null);
+        setGaps(null);
+        setAudit(null);
+      }
+      e.target.value = "";
+    },
+    style: {
+      background: C.surf2,
+      border: "1px solid " + C.border,
+      borderRadius: 6,
+      padding: "6px 12px",
+      color: C.textMid,
+      fontSize: 12,
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "Cargar aeropuerto..."), Object.entries(AIRPORTS).map(([key, ap]) => /*#__PURE__*/React.createElement("option", {
+    key: key,
+    value: key
+  }, ap._name)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxWidth: 980,
+      margin: "0 auto",
+      padding: "22px 16px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 14
+    }
+  }, /*#__PURE__*/React.createElement(Card, {
+    eyebrow: "Identificación",
+    title: "Aeródromo y Pista"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 11
+    }
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Aeropuerto",
+    value: d.airport,
+    onChange: upd("airport"),
+    placeholder: "Nombre del aeropuerto",
+    type: "text"
+  }), /*#__PURE__*/React.createElement(Field, {
+    label: "Designación de pista",
+    value: d.runway,
+    onChange: upd("runway"),
+    placeholder: "ej. 12/30",
+    type: "text"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 11
+    }
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Elevación del AD",
+    value: d.elevation,
+    onChange: upd("elevation"),
+    placeholder: "3826",
+    suffix: "m"
+  }), /*#__PURE__*/React.createElement(Field, {
+    label: "Temp. de referencia",
+    value: d.tempRef,
+    onChange: upd("tempRef"),
+    placeholder: "19.8",
+    suffix: "°C"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Label, null, "Categoría de operación general"), /*#__PURE__*/React.createElement("select", {
+    value: d.opCat,
+    onChange: e => upd("opCat")(e.target.value),
+    style: {
+      width: "100%",
+      background: C.surf3,
+      border: "1px solid " + C.border,
+      borderRadius: 5,
+      padding: "7px 10px",
+      color: d.opCat ? C.white : C.text,
+      fontSize: 13,
+      fontFamily: C.mono
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "— Seleccionar —"), Object.entries(OP_CATS).map(([key, cat]) => /*#__PURE__*/React.createElement("option", {
+    key: key,
+    value: key
+  }, cat.label)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 11
+    }
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Longitud física",
+    value: d.length,
+    onChange: upd("length"),
+    placeholder: "4200",
+    suffix: "m"
+  }), /*#__PURE__*/React.createElement(Field, {
+    label: "Ancho",
+    value: d.width,
+    onChange: upd("width"),
+    placeholder: "45",
+    suffix: "m"
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Ancho franja declarada AIP (total)",
+    value: d.stripDeclared,
+    onChange: upd("stripDeclared"),
+    placeholder: "150",
+    suffix: "m"
+  }))), /*#__PURE__*/React.createElement(Card, {
+    eyebrow: "Perfil Geométrico",
+    title: "Pendientes"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 11
+    }
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Pendiente media (max-min / longitud) §3.1.13",
+    value: d.slopeMean,
+    onChange: upd("slopeMean"),
+    placeholder: "1.0",
+    suffix: "%"
+  }), /*#__PURE__*/React.createElement(Field, {
+    label: "Pendiente longitudinal maxima local §3.1.14",
+    value: d.slopeMax,
+    onChange: upd("slopeMax"),
+    placeholder: "1.25",
+    suffix: "%"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 11
+    }
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Primer cuarto",
+    value: d.slopeQ1,
+    onChange: upd("slopeQ1"),
+    placeholder: "0.8",
+    suffix: "%"
+  }), /*#__PURE__*/React.createElement(Field, {
+    label: "Último cuarto",
+    value: d.slopeQ4,
+    onChange: upd("slopeQ4"),
+    placeholder: "0.8",
+    suffix: "%"
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "Pendiente transversal",
+    value: d.slopeTrans,
+    onChange: upd("slopeTrans"),
+    placeholder: "1.5",
+    suffix: "%"
+  })))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 14,
+      marginTop: 14
+    }
+  }, [["c1", "RWY 1"], ["c2", "RWY 2"]].map(([px, fallback]) => /*#__PURE__*/React.createElement(Card, {
+    key: px,
+    eyebrow: "Distancias Declaradas",
+    title: d[`${px}label`] || fallback
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 9
+    }
+  }, /*#__PURE__*/React.createElement(Field, {
+    label: "Designación",
+    value: d[`${px}label`],
+    onChange: upd(`${px}label`),
+    placeholder: fallback,
+    type: "text"
+  }), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Label, null, "Categoría de aproximación"), /*#__PURE__*/React.createElement("select", {
+    value: d[`${px}opCat`],
+    onChange: e => upd(`${px}opCat`)(e.target.value),
+    style: {
+      width: "100%",
+      background: C.surf3,
+      border: `1px solid ${C.border}`,
+      borderRadius: 5,
+      padding: "7px 10px",
+      color: d[`${px}opCat`] ? C.white : C.text,
+      fontSize: 12,
+      fontFamily: C.mono
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "— Seleccionar —"), Object.entries(OP_CATS).map(([key, cat]) => /*#__PURE__*/React.createElement("option", {
+    key: key,
+    value: key
+  }, cat.short, " — ", cat.label)))), ["tora", "toda", "asda", "lda"].map(k => /*#__PURE__*/React.createElement(Field, {
+    key: k,
+    label: k.toUpperCase(),
+    value: d[`${px}${k}`],
+    onChange: upd(`${px}${k}`),
+    placeholder: "",
+    suffix: "m"
+  })))))), /*#__PURE__*/React.createElement("button", {
+    onClick: handleAnalyze,
+    style: {
+      marginTop: 18,
+      width: "100%",
+      background: `linear-gradient(135deg, ${C.accent}, #3A7EC0)`,
+      color: C.bg,
+      border: "none",
+      borderRadius: 8,
+      padding: "13px 0",
+      fontSize: 14,
+      fontWeight: 800,
+      cursor: "pointer",
+      letterSpacing: "0.06em",
+      textTransform: "uppercase"
+    }
+  }, "▶ Analizar Pista"), results && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 26
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.text,
+      letterSpacing: "0.12em",
+      textTransform: "uppercase",
+      marginBottom: 12
+    }
+  }, "── Resultados ──────────────────────────────────────────────────"), (() => {
+    const alert = getElevationAlert(d.elevation);
+    if (!alert) return null;
+    const alertColor = alert.level === "danger" ? C.danger : alert.level === "warn" ? C.warn : C.accent;
+    const alertBg = alert.level === "danger" ? C.dangerDim : alert.level === "warn" ? C.warnDim : C.accentDim;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        padding: "12px 14px",
+        background: alertBg,
+        borderRadius: 8,
+        borderLeft: "3px solid " + alertColor,
+        marginBottom: 14
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: alertColor,
+        fontWeight: 800,
+        textTransform: "uppercase",
+        letterSpacing: "0.08em",
+        marginBottom: 4
+      }
+    }, alert.level === "danger" ? "⚠ " : "△ ", alert.label, d.elevation && /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: C.mono,
+        marginLeft: 8
+      }
+    }, parseFloat(d.elevation).toFixed(0), " m / ", (parseFloat(d.elevation) * 3.28084).toFixed(0), " ft AMSL"), d.tempRef && /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: C.mono,
+        marginLeft: 8
+      }
+    }, "T ref: ", d.tempRef, "°C")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: C.textBright,
+        lineHeight: 1.5
+      }
+    }, alert.note));
+  })(), d.opCat && (() => {
+    const cat = OP_CATS[d.opCat];
+    const length = parseFloat(d.length);
+    const lengthOk = !cat.minLength || length >= cat.minLength;
+    const stripOk = parseFloat(d.width) >= cat.stripWidth;
+    return /*#__PURE__*/React.createElement(Card, {
+      eyebrow: "Categoría de Operación",
+      style: {
+        marginBottom: 14,
+        borderColor: cat.color + "55"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 14,
+        flexWrap: "wrap"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        background: cat.color + "22",
+        border: `1px solid ${cat.color}55`,
+        borderRadius: 8,
+        padding: "6px 16px"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: C.mono,
+        fontSize: 18,
+        fontWeight: 900,
+        color: cat.color
+      }
+    }, cat.short)), /*#__PURE__*/React.createElement("div", {
+      style: {
+        flex: 1
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 14,
+        color: C.white,
+        fontWeight: 700
+      }
+    }, cat.label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: C.text,
+        marginTop: 2
+      }
+    }, cat.notes))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "repeat(3, 1fr)",
+        gap: 10,
+        marginTop: 14
+      }
+    }, [{
+      label: "Sup. aproximación",
+      val: cat.approachSlope
+    }, {
+      label: "Ancho franja mín.",
+      val: `${cat.stripWidth} m`,
+      ok: stripOk
+    }, {
+      label: "DH / RVR",
+      val: cat.dhRvr
+    }, ...(cat.minLength ? [{
+      label: "Long. mín. referencial",
+      val: `${cat.minLength} m`,
+      ok: lengthOk
+    }] : [])].map(({
+      label,
+      val,
+      ok
+    }) => /*#__PURE__*/React.createElement("div", {
+      key: label,
+      style: {
+        background: C.surf2,
+        borderRadius: 6,
+        padding: "8px 10px"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: C.text,
+        textTransform: "uppercase",
+        letterSpacing: "0.08em",
+        marginBottom: 3
+      }
+    }, label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: C.mono,
+        fontSize: 12,
+        color: ok === false ? C.danger : ok === true ? C.ok : C.textBright,
+        fontWeight: 700
+      }
+    }, val), ok === true && /*#__PURE__*/React.createElement(StatusIcon, {
+      ok: true
+    }), ok === false && /*#__PURE__*/React.createElement(StatusIcon, {
+      ok: false
+    }))))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 10,
+        fontSize: 11,
+        color: C.text
+      }
+    }, "⚠ Parámetros de aproximación referenciales — Anexo 14, Vol. I, 9ª ed. (julio 2022)."));
+  })(), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "260px 1fr",
+      gap: 14
+    }
+  }, /*#__PURE__*/React.createElement(Card, null, /*#__PURE__*/React.createElement(ARCBadge, {
+    num: results.arcNum,
+    letter: results.arcLetter
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderTop: `1px solid ${C.border}`,
+      paddingTop: 10,
+      marginTop: 6,
+      display: "flex",
+      flexDirection: "column",
+      gap: 6
+    }
+  }, [{
+    label: "Long. máx.",
+    val: `${results.limits.maxLong}%`
+  }, {
+    label: "Cuartos",
+    val: `${results.limits.quarter}%`
+  }, {
+    label: "Transv.",
+    val: `${results.limits.transverse}%`
+  }].map(({
+    label,
+    val
+  }) => /*#__PURE__*/React.createElement("div", {
+    key: label,
+    style: {
+      display: "flex",
+      justifyContent: "space-between"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: C.text
+    }
+  }, label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontFamily: C.mono,
+      color: C.textMid
+    }
+  }, val))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 6,
+      fontSize: 10,
+      color: C.text,
+      lineHeight: 1.5
+    }
+  }, "Referencia: Cuadro 3-1", /*#__PURE__*/React.createElement("br", null), "Verificar enmiendas vigentes"))), /*#__PURE__*/React.createElement(Card, {
+    eyebrow: "Verificación — 9ª edición",
+    title: "Cumplimiento de Pendientes"
+  }, [{
+    label: "Pendiente media §3.1.13 (max-min/long)",
+    key: "slopeMean",
+    limit: results.meanLimit
+  }, {
+    label: "Pendiente long. maxima local §3.1.14",
+    key: "slopeMax",
+    limit: results.limits.maxLong
+  }, {
+    label: "Pendiente 1er cuarto §3.1.14",
+    key: "slopeQ1",
+    limit: results.quarterLimit
+  }, {
+    label: "Pendiente ultimo cuarto §3.1.14",
+    key: "slopeQ4",
+    limit: results.quarterLimit
+  }, {
+    label: "Pendiente transversal §3.1.19",
+    key: "slopeTrans",
+    limit: results.limits.transverse
+  }].map(({
+    label,
+    key,
+    limit
+  }) => {
+    const val = parseFloat(d[key]);
+    if (isNaN(val)) return null;
+    const ok = val <= limit;
+    return /*#__PURE__*/React.createElement("div", {
+      key: key,
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "7px 0",
+        borderBottom: `1px solid ${C.border}`
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        flex: 2,
+        fontSize: 13,
+        color: C.textMid
+      }
+    }, label), /*#__PURE__*/React.createElement("span", {
+      style: {
+        width: 64,
+        textAlign: "right",
+        fontFamily: C.mono,
+        fontSize: 13,
+        color: C.white
+      }
+    }, val, "%"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        width: 64,
+        textAlign: "right",
+        fontFamily: C.mono,
+        fontSize: 11,
+        color: C.text
+      }
+    }, "≤ ", limit, "%"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        width: 20,
+        textAlign: "center"
+      }
+    }, /*#__PURE__*/React.createElement(StatusIcon, {
+      ok: ok
+    })));
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      display: "flex",
+      gap: 8,
+      flexWrap: "wrap"
+    }
+  }, (() => {
+    const checks = [{
+      key: "slopeMax",
+      limit: results.limits.maxLong
+    }, {
+      key: "slopeQ1",
+      limit: results.limits.quarter
+    }, {
+      key: "slopeQ4",
+      limit: results.limits.quarter
+    }, {
+      key: "slopeTrans",
+      limit: results.limits.transverse
+    }].filter(c => !isNaN(parseFloat(d[c.key])));
+    const fails = checks.filter(c => parseFloat(d[c.key]) > c.limit);
+    return fails.length > 0 ? /*#__PURE__*/React.createElement(Pill, {
+      label: `${fails.length} pendiente${fails.length > 1 ? "s" : ""} fuera de límite`,
+      color: C.danger,
+      bg: C.dangerDim
+    }) : /*#__PURE__*/React.createElement(Pill, {
+      label: "Todas las pendientes dentro de límites",
+      color: C.ok,
+      bg: C.okDim
+    });
+  })()))), results.dd.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 14,
+      marginTop: 14
+    }
+  }, results.dd.map((dd, i) => /*#__PURE__*/React.createElement(Card, {
+    key: i,
+    eyebrow: "Distancias Declaradas",
+    title: dd.label
+  }, dd.opCat && (() => {
+    const cat = OP_CATS[dd.opCat];
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        marginBottom: 10,
+        padding: "5px 8px",
+        background: cat.color + "18",
+        borderRadius: 6,
+        border: `1px solid ${cat.color}33`
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontFamily: C.mono,
+        fontSize: 12,
+        fontWeight: 800,
+        color: cat.color
+      }
+    }, cat.short), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 11,
+        color: C.textMid
+      }
+    }, cat.label), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 10,
+        color: C.text,
+        marginLeft: "auto"
+      }
+    }, cat.dhRvr));
+  })(), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 0
+    }
+  }, ["tora", "toda", "asda", "lda"].map(k => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    style: {
+      padding: "6px 0",
+      borderBottom: `1px solid ${C.border}`,
+      paddingRight: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.accent,
+      fontFamily: C.mono,
+      fontWeight: 700
+    }
+  }, k.toUpperCase()), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14,
+      color: C.white,
+      fontFamily: C.mono,
+      marginTop: 1
+    }
+  }, dd[k], " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 10,
+      color: C.text
+    }
+  }, "m"))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 6
+    }
+  }, dd.clearway > 0 && /*#__PURE__*/React.createElement(Pill, {
+    label: `CWY ${dd.clearway} m`,
+    color: C.ok,
+    bg: C.okDim
+  }), dd.stopway > 0 && /*#__PURE__*/React.createElement(Pill, {
+    label: `SWY ${dd.stopway} m`,
+    color: C.ok,
+    bg: C.okDim
+  }), dd.displaced > 0 && /*#__PURE__*/React.createElement(Pill, {
+    label: `THR desplazado ${dd.displaced} m`,
+    color: C.warn,
+    bg: C.warnDim
+  }), !dd.clearway && !dd.stopway && !dd.displaced && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: C.text
+    }
+  }, "Sin elementos especiales"), !dd.coherent && /*#__PURE__*/React.createElement(Pill, {
+    label: "⚠ Inconsistencia en distancias",
+    color: C.danger,
+    bg: C.dangerDim
+  })), /*#__PURE__*/React.createElement(RunwayDiagram, {
+    dd: dd
+  })))), /*#__PURE__*/React.createElement(Card, {
+    eyebrow: "Análisis de Brechas",
+    title: "Subida de Categoría ARC",
+    style: {
+      marginTop: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 12,
+      alignItems: "flex-end",
+      flexWrap: "wrap",
+      marginBottom: 18
+    }
+  }, [{
+    label: "Número objetivo",
+    field: "num",
+    options: [1, 2, 3, 4]
+  }].map(({
+    label,
+    field,
+    options
+  }) => /*#__PURE__*/React.createElement("div", {
+    key: field
+  }, /*#__PURE__*/React.createElement(Label, null, label), /*#__PURE__*/React.createElement("select", {
+    value: target.num,
+    onChange: e => setTarget({
+      num: e.target.value,
+      letter: "",
+      opCat: target.opCat
+    }),
+    style: {
+      background: C.surf3,
+      border: `1px solid ${C.border}`,
+      borderRadius: 5,
+      padding: "7px 12px",
+      color: C.white,
+      fontSize: 14,
+      fontFamily: C.mono,
+      minWidth: 80
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "—"), options.map(o => /*#__PURE__*/React.createElement("option", {
+    key: o,
+    value: o
+  }, o))))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Label, null, "Letra objetivo"), /*#__PURE__*/React.createElement("select", {
+    value: target.letter,
+    onChange: e => setTarget(t => ({
+      ...t,
+      letter: e.target.value
+    })),
+    disabled: !target.num,
+    style: {
+      background: C.surf3,
+      border: `1px solid ${C.border}`,
+      borderRadius: 5,
+      padding: "7px 12px",
+      color: C.white,
+      fontSize: 14,
+      fontFamily: C.mono,
+      minWidth: 80,
+      opacity: target.num ? 1 : 0.4
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "—"), getCompatibleLetters(target.num).map(l => /*#__PURE__*/React.createElement("option", {
+    key: l,
+    value: l
+  }, l)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Label, null, "Categoría objetivo"), /*#__PURE__*/React.createElement("select", {
+    value: target.opCat,
+    onChange: e => setTarget(t => ({
+      ...t,
+      opCat: e.target.value
+    })),
+    style: {
+      background: C.surf3,
+      border: `1px solid ${C.border}`,
+      borderRadius: 5,
+      padding: "7px 12px",
+      color: C.white,
+      fontSize: 13,
+      fontFamily: C.mono,
+      minWidth: 120
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "— Opcional —"), Object.entries(OP_CATS).map(([key, cat]) => /*#__PURE__*/React.createElement("option", {
+    key: key,
+    value: key
+  }, cat.short)))), /*#__PURE__*/React.createElement("button", {
+    onClick: handleGapAnalysis,
+    disabled: !target.num || !target.letter,
+    style: {
+      background: target.num && target.letter ? C.surf3 : C.surf2,
+      border: `1px solid ${target.num && target.letter ? C.accent : C.border}`,
+      borderRadius: 6,
+      padding: "7px 18px",
+      color: target.num && target.letter ? C.accent : C.text,
+      fontSize: 13,
+      fontWeight: 700,
+      cursor: target.num && target.letter ? "pointer" : "default",
+      marginTop: 18
+    }
+  }, "Calcular brechas →")), gaps && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 12,
+      marginBottom: 14,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: C.mono,
+      fontSize: 14
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.white,
+      fontWeight: 800
+    }
+  }, "ARC ", gaps.from), gaps.fromCat && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.text,
+      fontSize: 12
+    }
+  }, " ", gaps.fromCat), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.accent,
+      margin: "0 10px",
+      fontSize: 16
+    }
+  }, "→"), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.white,
+      fontWeight: 800
+    }
+  }, "ARC ", gaps.to), gaps.toCat && /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: C.text,
+      fontSize: 12
+    }
+  }, " ", gaps.toCat)), gaps.critical.length > 0 ? /*#__PURE__*/React.createElement(Pill, {
+    label: `${gaps.critical.length} brecha${gaps.critical.length > 1 ? "s" : ""} crítica${gaps.critical.length > 1 ? "s" : ""}`,
+    color: C.danger,
+    bg: C.dangerDim
+  }) : /*#__PURE__*/React.createElement(Pill, {
+    label: "Sin brechas físicas",
+    color: C.ok,
+    bg: C.okDim
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontSize: 13
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      background: C.surf2
+    }
+  }, ["Parámetro", "Estado actual", "Requisito", "Delta", "Intervención"].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      padding: "8px 12px",
+      textAlign: "left",
+      fontSize: 10,
+      color: C.text,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase",
+      fontWeight: 700,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, gaps.rows.map((row, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i,
+    style: {
+      background: i % 2 === 0 ? C.surf : C.surf2
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      color: C.textMid,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, row.param), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      fontFamily: C.mono,
+      color: C.white,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, row.current), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      fontFamily: C.mono,
+      color: C.text,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, row.required), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      fontFamily: C.mono,
+      fontWeight: 800,
+      color: row.ok ? C.ok : C.danger,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, row.delta), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-block",
+      padding: "2px 8px",
+      borderRadius: 4,
+      fontSize: 11,
+      fontWeight: 600,
+      background: row.ok ? C.okDim : C.dangerDim,
+      color: row.ok ? C.ok : C.danger
+    }
+  }, row.action))))))), gaps.catRows && gaps.catRows.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: C.accent,
+      letterSpacing: "0.1em",
+      textTransform: "uppercase",
+      fontWeight: 700,
+      marginBottom: 8
+    }
+  }, "Brechas de Categoría de Operación — ", gaps.fromCat, " → ", gaps.toCat), /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse",
+      fontSize: 13
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      background: C.surf2
+    }
+  }, ["Parámetro", "Actual", "Objetivo", "Delta", "Intervención"].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      padding: "8px 12px",
+      textAlign: "left",
+      fontSize: 10,
+      color: C.text,
+      letterSpacing: "0.08em",
+      textTransform: "uppercase",
+      fontWeight: 700,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, gaps.catRows.map((row, i) => /*#__PURE__*/React.createElement("tr", {
+    key: i,
+    style: {
+      background: i % 2 === 0 ? C.surf : C.surf2
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      color: C.textMid,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, row.param), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      fontFamily: C.mono,
+      fontSize: 12,
+      color: C.text,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, row.current), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      fontFamily: C.mono,
+      fontSize: 12,
+      color: C.white,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, row.required), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      fontFamily: C.mono,
+      fontWeight: 800,
+      color: row.ok === false ? C.danger : row.ok === true ? C.ok : C.text,
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, row.delta), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: "8px 12px",
+      borderBottom: `1px solid ${C.border}`
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-block",
+      padding: "2px 8px",
+      borderRadius: 4,
+      fontSize: 11,
+      fontWeight: 600,
+      background: row.ok === false ? C.dangerDim : row.ok === true ? C.okDim : C.accentDim,
+      color: row.ok === false ? C.danger : row.ok === true ? C.ok : C.accent
+    }
+  }, row.action)))))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      padding: "14px 16px",
+      background: gaps.critical.length > 0 ? C.dangerDim : C.okDim,
+      borderRadius: 8,
+      borderLeft: `3px solid ${gaps.critical.length > 0 ? C.danger : C.ok}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: gaps.critical.length > 0 ? C.danger : C.ok,
+      fontWeight: 700,
+      textTransform: "uppercase",
+      letterSpacing: "0.08em",
+      marginBottom: 6
+    }
+  }, gaps.critical.length > 0 ? "⚠ Obras requeridas" : "✓ Compatible con ARC objetivo"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: C.textBright,
+      lineHeight: 1.6
+    }
+  }, gaps.critical.length > 0 ? /*#__PURE__*/React.createElement(React.Fragment, null, "Se identificaron ", /*#__PURE__*/React.createElement("strong", null, gaps.critical.length), " brecha", gaps.critical.length > 1 ? "s" : "", " crítica", gaps.critical.length > 1 ? "s" : "", " para alcanzar ", /*#__PURE__*/React.createElement("strong", null, "ARC ", gaps.to), ".", " ", "Las intervenciones requeridas son:", " ", [...new Set(gaps.critical.map(r => r.action))].join(", "), ".") : /*#__PURE__*/React.createElement(React.Fragment, null, "Los parámetros físicos analizados son compatibles con ", /*#__PURE__*/React.createElement("strong", null, "ARC ", gaps.to), ". Verificar separaciones de calles de rodaje, franjas de pista y superficies OLS antes de modificar la designación.")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: C.text,
+      marginTop: 8
+    }
+  }, "⚠ Análisis preliminar. OACI Anexo 14, Vol. I, 9ª ed. (julio 2022). Realizar estudio topográfico certificado.")))), audit && (() => {
+    const statusCfg = {
+      "conforme": {
+        label: "CONFORME",
+        color: C.ok,
+        bg: C.okDim,
+        icon: "✓"
+      },
+      "conforme-obs": {
+        label: "CONFORME CON OBSERVACIONES",
+        color: C.warn,
+        bg: C.warnDim,
+        icon: "⚠"
+      },
+      "no-conforme": {
+        label: "NO CONFORME",
+        color: C.danger,
+        bg: C.dangerDim,
+        icon: "✗"
+      }
+    }[audit.status];
+    return /*#__PURE__*/React.createElement(Card, {
+      eyebrow: "Informe de Auditoría — OACI Anexo 14",
+      style: {
+        marginTop: 14,
+        borderColor: statusCfg.color + "44"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "grid",
+        gridTemplateColumns: "1fr auto",
+        gap: 16,
+        alignItems: "start",
+        marginBottom: 18,
+        paddingBottom: 14,
+        borderBottom: `1px solid ${C.border}`
+      }
+    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 16,
+        fontWeight: 900,
+        color: C.white
+      }
+    }, d.airport || "Aeropuerto sin nombre"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 12,
+        color: C.textMid,
+        marginTop: 3,
+        fontFamily: C.mono
+      }
+    }, "Pista ", d.runway || "—", " | ARC ", results.arcNum, results.arcLetter, " | ", audit.date), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 6,
+        display: "flex",
+        gap: 6,
+        flexWrap: "wrap"
+      }
+    }, results.dd.map((rwy, i) => rwy.opCat && /*#__PURE__*/React.createElement("span", {
+      key: i,
+      style: {
+        fontSize: 11,
+        color: OP_CATS[rwy.opCat].color,
+        background: OP_CATS[rwy.opCat].color + "18",
+        padding: "1px 7px",
+        borderRadius: 4,
+        fontFamily: C.mono,
+        fontWeight: 700
+      }
+    }, rwy.label, ": ", OP_CATS[rwy.opCat].short)))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "center",
+        background: statusCfg.bg,
+        border: `1px solid ${statusCfg.color}44`,
+        borderRadius: 8,
+        padding: "10px 18px"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 22,
+        color: statusCfg.color,
+        fontWeight: 900
+      }
+    }, statusCfg.icon), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 10,
+        color: statusCfg.color,
+        fontWeight: 800,
+        letterSpacing: "0.08em",
+        textTransform: "uppercase",
+        marginTop: 2,
+        maxWidth: 140
+      }
+    }, statusCfg.label), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: C.text,
+        marginTop: 6
+      }
+    }, audit.ncs.length, " NC · ", audit.obs.length, " OB"))), audit.findings.length === 0 ? /*#__PURE__*/React.createElement("div", {
+      style: {
+        textAlign: "center",
+        padding: "20px 0",
+        color: C.ok,
+        fontSize: 14
+      }
+    }, "✓ No se identificaron hallazgos. La pista cumple todos los parámetros evaluados.") : /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        flexDirection: "column",
+        gap: 10
+      }
+    }, audit.findings.map((f, i) => {
+      const isNC = f.severity === "NC";
+      const fColor = isNC ? C.danger : C.warn;
+      const fBg = isNC ? C.dangerDim : C.warnDim;
+      return /*#__PURE__*/React.createElement("div", {
+        key: i,
+        style: {
+          border: `1px solid ${fColor}33`,
+          borderRadius: 8,
+          overflow: "hidden"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          background: fBg,
+          padding: "8px 12px"
+        }
+      }, /*#__PURE__*/React.createElement("span", {
+        style: {
+          fontFamily: C.mono,
+          fontSize: 11,
+          fontWeight: 900,
+          color: fColor,
+          minWidth: 60
+        }
+      }, f.id), /*#__PURE__*/React.createElement("span", {
+        style: {
+          flex: 1,
+          fontSize: 13,
+          color: C.white,
+          fontWeight: 700
+        }
+      }, f.param), /*#__PURE__*/React.createElement("span", {
+        style: {
+          fontSize: 10,
+          color: fColor,
+          background: fColor + "22",
+          padding: "1px 7px",
+          borderRadius: 4,
+          fontWeight: 700
+        }
+      }, f.ref), /*#__PURE__*/React.createElement("span", {
+        style: {
+          fontSize: 10,
+          color: fColor,
+          fontWeight: 800,
+          letterSpacing: "0.08em"
+        }
+      }, f.severity)), /*#__PURE__*/React.createElement("div", {
+        style: {
+          padding: "10px 12px",
+          background: C.surf2,
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: "6px 16px"
+        }
+      }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 10,
+          color: C.text,
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+          marginBottom: 2
+        }
+      }, "Valor encontrado"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 12,
+          fontFamily: C.mono,
+          color: fColor,
+          fontWeight: 700
+        }
+      }, f.found)), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 10,
+          color: C.text,
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+          marginBottom: 2
+        }
+      }, "Requisito normativo"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 12,
+          fontFamily: C.mono,
+          color: C.textMid
+        }
+      }, f.required)), /*#__PURE__*/React.createElement("div", {
+        style: {
+          gridColumn: "1 / -1",
+          marginTop: 4
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 10,
+          color: C.text,
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+          marginBottom: 2
+        }
+      }, "Descripción"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 12,
+          color: C.textBright,
+          lineHeight: 1.5
+        }
+      }, f.description)), /*#__PURE__*/React.createElement("div", {
+        style: {
+          gridColumn: "1 / -1"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 10,
+          color: C.accent,
+          textTransform: "uppercase",
+          letterSpacing: "0.08em",
+          marginBottom: 2
+        }
+      }, "Recomendación"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          fontSize: 12,
+          color: C.textBright,
+          lineHeight: 1.5
+        }
+      }, f.recommendation))));
+    })), /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 16,
+        padding: "12px 14px",
+        background: statusCfg.bg,
+        borderRadius: 8,
+        borderLeft: `3px solid ${statusCfg.color}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: statusCfg.color,
+        fontWeight: 800,
+        textTransform: "uppercase",
+        letterSpacing: "0.08em",
+        marginBottom: 6
+      }
+    }, "Resumen ejecutivo"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 13,
+        color: C.textBright,
+        lineHeight: 1.6
+      }
+    }, audit.status === "conforme" && `La pista ${d.runway || ""} del ${d.airport || "aeropuerto"} cumple todos los parámetros físicos evaluados conforme al ARC ${results.arcNum}${results.arcLetter} y las categorías de operación declaradas.`, audit.status === "conforme-obs" && `La pista ${d.runway || ""} no presenta no conformidades, pero se identificaron ${audit.obs.length} observación${audit.obs.length > 1 ? "es" : ""} por datos no declarados. Se recomienda completar la información para una evaluación integral.`, audit.status === "no-conforme" && `La pista ${d.runway || ""} presenta ${audit.ncs.length} no conformidad${audit.ncs.length > 1 ? "es" : ""} respecto al ARC ${results.arcNum}${results.arcLetter} y las categorías de operación declaradas. Se requieren intervenciones correctivas antes de modificar o mantener la designación actual.`), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 11,
+        color: C.text,
+        marginTop: 8
+      }
+    }, "Referencia: OACI Anexo 14, Vol. I, 9ª edición (julio 2022). Análisis preliminar — no sustituye evaluación técnica certificada.")), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "flex-end",
+        marginTop: 14,
+        gap: 8,
+        alignItems: "center"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 11,
+        color: C.text
+      }
+    }, "Abre el archivo descargado en el browser y usa Ctrl+P para PDF"), /*#__PURE__*/React.createElement("button", {
+      onClick: handlePrint,
+      style: {
+        background: C.surf3,
+        border: "1px solid " + C.borderBright,
+        borderRadius: 6,
+        padding: "8px 20px",
+        color: C.textBright,
+        fontSize: 13,
+        fontWeight: 700,
+        cursor: "pointer",
+        whiteSpace: "nowrap"
+      }
+    }, "Descargar informe HTML")));
+  })())));
+}
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+  <script>
+    if ("serviceWorker" in navigator && location.protocol === "https:") {
+      navigator.serviceWorker.register("sw.js").catch(function() {});
+    }
+  </script>
+</body>
+</html>
