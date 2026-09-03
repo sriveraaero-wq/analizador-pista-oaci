@@ -1,0 +1,21 @@
+{
+  "name": "Analizador de Pista OACI",
+  "short_name": "Pista OACI",
+  "description": "Caracterización y auditoría de pistas según OACI Anexo 14, 9ª edición",
+  "start_url": "/analizador-pista-oaci/",
+  "scope": "/analizador-pista-oaci/",
+  "display": "standalone",
+  "background_color": "#07111F",
+  "theme_color": "#07111F",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/sriveraaero-wq/analizador-pista-oaci/main/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "utilities"],
+  "lang": "es"
+}
